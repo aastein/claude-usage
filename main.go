@@ -637,19 +637,39 @@ func activeUUID() string {
 
 func poll(s *store) []result {
 	active := activeUUID()
+	// The active account's token is rotated by Claude Code out-of-band. Treat
+	// the keychain as the source of truth for it so we never refresh with a
+	// stale (rotated-away) refresh token, which fails with invalid_grant.
+	kc, kcErr := keychainCredential()
+
 	results := make([]result, len(s.Accounts))
 	changed := false
 	for i := range s.Accounts {
-		u, nc, err := fetchUsage(s.Accounts[i].Credential)
+		isActive := active != "" && s.Accounts[i].AccountUUID == active
+
+		cred := s.Accounts[i].Credential
+		if isActive && kcErr == nil {
+			cred = kc // freshest token; Claude Code keeps this valid
+		}
+
+		inputTok := cred.AccessToken
+		u, nc, err := fetchUsage(cred)
+
 		if nc.AccessToken != s.Accounts[i].Credential.AccessToken {
 			s.Accounts[i].Credential = nc
 			changed = true
 		}
+		// If we ourselves rotated the active account's token, write it back to
+		// the keychain so Claude Code and we keep using the same credential.
+		if isActive && err == nil && nc.AccessToken != inputTok {
+			_ = writeKeychainCredential(nc)
+		}
+
 		results[i] = result{
 			email:  s.Accounts[i].Email,
 			uuid:   s.Accounts[i].AccountUUID,
 			usage:  u,
-			active: active != "" && s.Accounts[i].AccountUUID == active,
+			active: isActive,
 			err:    err,
 		}
 	}
