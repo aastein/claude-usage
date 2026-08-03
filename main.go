@@ -17,12 +17,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // oauthClientID is Claude Code's public OAuth client id, used for the login and
@@ -31,6 +32,7 @@ const oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 const (
 	usageURL     = "https://api.anthropic.com/api/oauth/usage"
+	profileURL   = "https://api.anthropic.com/api/oauth/profile"
 	authorizeURL = "https://claude.ai/oauth/authorize"
 	tokenURL     = "https://platform.claude.com/v1/oauth/token"
 	redirectURI  = "https://platform.claude.com/oauth/code/callback"
@@ -53,10 +55,13 @@ type credential struct {
 	SubscriptionType      string   `json:"subscriptionType,omitempty"`
 }
 
-// account pairs a user-facing label with its credential.
+// account identifies a monitored account by its stable email/uuid and holds its
+// OAuth credential. Email is the display identity; AccountUUID matches against
+// the currently logged-in Claude Code session.
 type account struct {
-	Label      string     `json:"label"`
-	Credential credential `json:"credential"`
+	Email       string     `json:"email"`
+	AccountUUID string     `json:"accountUUID"`
+	Credential  credential `json:"credential"`
 }
 
 // store is the on-disk config: the set of monitored accounts.
@@ -109,6 +114,42 @@ func saveStore(s *store) error {
 		return err
 	}
 	return os.Rename(tmp, p)
+}
+
+// normalizeStore backfills missing email/uuid identities (for accounts saved
+// before identity tracking) and removes duplicate accounts that resolve to the
+// same uuid, keeping the most recently added. It persists any change.
+func normalizeStore(s *store) {
+	changed := false
+	for i := range s.Accounts {
+		if s.Accounts[i].AccountUUID == "" || s.Accounts[i].Email == "" {
+			if uuid, email, err := fetchProfile(s.Accounts[i].Credential.AccessToken); err == nil {
+				s.Accounts[i].AccountUUID = uuid
+				s.Accounts[i].Email = email
+				changed = true
+			}
+		}
+	}
+	// Dedup by uuid, keeping the last occurrence (most recently added/updated).
+	seen := map[string]int{}
+	out := make([]account, 0, len(s.Accounts))
+	for _, a := range s.Accounts {
+		if a.AccountUUID == "" {
+			out = append(out, a) // unresolved; keep as-is
+			continue
+		}
+		if idx, ok := seen[a.AccountUUID]; ok {
+			out[idx] = a // replace earlier duplicate
+			changed = true
+			continue
+		}
+		seen[a.AccountUUID] = len(out)
+		out = append(out, a)
+	}
+	s.Accounts = out
+	if changed {
+		_ = saveStore(s)
+	}
 }
 
 // keychainCredential reads the current Claude Code credential from the macOS Keychain.
@@ -192,6 +233,38 @@ func fetchUsage(c credential) (usageResponse, credential, error) {
 
 var errUnauthorized = fmt.Errorf("unauthorized")
 
+// fetchProfile returns the stable account uuid and email for a token.
+func fetchProfile(token string) (uuid, email string, err error) {
+	req, err := http.NewRequest(http.MethodGet, profileURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("anthropic-beta", oauthBeta)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", "", errUnauthorized
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("profile error (%d)", resp.StatusCode)
+	}
+	var p struct {
+		Account struct {
+			UUID  string `json:"uuid"`
+			Email string `json:"email"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return "", "", err
+	}
+	return p.Account.UUID, p.Account.Email, nil
+}
+
 func callUsage(token string) (usageResponse, error) {
 	req, err := http.NewRequest(http.MethodGet, usageURL, nil)
 	if err != nil {
@@ -226,16 +299,13 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "login":
-			cmdLogin(os.Args[2:])
+			cmdLogin()
 			return
 		case "add":
-			cmdAdd(os.Args[2:])
+			cmdAdd()
 			return
 		case "list":
 			cmdList()
-			return
-		case "rename", "mv":
-			cmdRename(os.Args[2:])
 			return
 		case "rm":
 			cmdRm(os.Args[2:])
@@ -255,28 +325,23 @@ func main() {
 func usage() {
 	fmt.Print(`claude-usage — monitor Claude Max usage across accounts
 
-  claude-usage login <label>  browser OAuth for an account (no Claude Code session change)
-  claude-usage add <label>    capture the account currently logged into Claude Code
+  claude-usage login          browser OAuth for an account (no Claude Code session change)
+  claude-usage add            capture the account currently logged into Claude Code
   claude-usage list           list configured accounts
-  claude-usage rename <old> <new>  rename an account
-  claude-usage rm <label>     remove an account
+  claude-usage rm <email>     remove an account
   claude-usage                live dashboard
 
-Add extra accounts without disrupting Claude Code: run 'login <label>' and sign
-in to that account in the browser. Nothing touches Claude Code's session.
+Accounts are identified by their email (read from the account profile) — no
+manual naming. Add extra accounts without disrupting Claude Code: run 'login'
+and sign in to that account in the browser. Nothing touches Claude Code's session.
 `)
 }
 
 // cmdLogin runs a standalone OAuth PKCE login for one account. It opens the
 // browser, the user signs in to the desired account, pastes back the code, and
-// the resulting tokens are stored under the label — independent of Claude Code.
-func cmdLogin(args []string) {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: claude-usage login <label>")
-		os.Exit(2)
-	}
-	label := args[0]
-
+// the resulting tokens are stored, identified by the account email — independent
+// of Claude Code.
+func cmdLogin() {
 	verifier := randB64URL(32)
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
@@ -321,11 +386,12 @@ func cmdLogin(args []string) {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	if err := upsertAccount(label, c); err != nil {
+	email, err := upsertAccount(c)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("logged in and saved account %q (subscription: %s)\n", label, c.SubscriptionType)
+	fmt.Printf("logged in and saved account %s\n", email)
 }
 
 // exchangeCode swaps an authorization code for tokens.
@@ -378,41 +444,44 @@ func randB64URL(n int) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-// upsertAccount adds or replaces an account by label and persists the store.
-func upsertAccount(label string, c credential) error {
+// upsertAccount resolves the credential's stable identity (email/uuid) via the
+// profile endpoint, then adds or replaces the matching account and persists the
+// store. It returns the account email.
+func upsertAccount(c credential) (string, error) {
+	uuid, email, err := fetchProfile(c.AccessToken)
+	if err != nil {
+		return "", fmt.Errorf("resolve account identity: %w", err)
+	}
 	s, err := loadStore()
 	if err != nil {
-		return err
+		return "", err
 	}
 	replaced := false
 	for i := range s.Accounts {
-		if s.Accounts[i].Label == label {
+		if s.Accounts[i].AccountUUID == uuid {
+			s.Accounts[i].Email = email
 			s.Accounts[i].Credential = c
 			replaced = true
 		}
 	}
 	if !replaced {
-		s.Accounts = append(s.Accounts, account{Label: label, Credential: c})
+		s.Accounts = append(s.Accounts, account{Email: email, AccountUUID: uuid, Credential: c})
 	}
-	return saveStore(s)
+	return email, saveStore(s)
 }
 
-func cmdAdd(args []string) {
-	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: claude-usage add <label>")
-		os.Exit(2)
-	}
-	label := args[0]
+func cmdAdd() {
 	c, err := keychainCredential()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	if err := upsertAccount(label, c); err != nil {
+	email, err := upsertAccount(c)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("saved account %q (subscription: %s)\n", label, c.SubscriptionType)
+	fmt.Printf("saved account %s\n", email)
 }
 
 func cmdList() {
@@ -422,52 +491,18 @@ func cmdList() {
 		os.Exit(1)
 	}
 	if len(s.Accounts) == 0 {
-		fmt.Println("no accounts configured — run: claude-usage add <label>")
+		fmt.Println("no accounts configured — run: claude-usage login")
 		return
 	}
+	normalizeStore(s)
 	for _, a := range s.Accounts {
-		fmt.Printf("%-16s %s\n", a.Label, a.Credential.SubscriptionType)
+		fmt.Println(a.Email)
 	}
-}
-
-func cmdRename(args []string) {
-	if len(args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: claude-usage rename <old> <new>")
-		os.Exit(2)
-	}
-	oldLabel, newLabel := args[0], args[1]
-	s, err := loadStore()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
-	}
-	for _, a := range s.Accounts {
-		if a.Label == newLabel {
-			fmt.Fprintf(os.Stderr, "error: an account named %q already exists\n", newLabel)
-			os.Exit(1)
-		}
-	}
-	found := false
-	for i := range s.Accounts {
-		if s.Accounts[i].Label == oldLabel {
-			s.Accounts[i].Label = newLabel
-			found = true
-		}
-	}
-	if !found {
-		fmt.Fprintf(os.Stderr, "error: no account named %q\n", oldLabel)
-		os.Exit(1)
-	}
-	if err := saveStore(s); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
-	}
-	fmt.Printf("renamed %q to %q\n", oldLabel, newLabel)
 }
 
 func cmdRm(args []string) {
 	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: claude-usage rm <label>")
+		fmt.Fprintln(os.Stderr, "usage: claude-usage rm <email>")
 		os.Exit(2)
 	}
 	s, err := loadStore()
@@ -477,12 +512,12 @@ func cmdRm(args []string) {
 	}
 	out := s.Accounts[:0]
 	for _, a := range s.Accounts {
-		if a.Label != args[0] {
+		if a.Email != args[0] {
 			out = append(out, a)
 		}
 	}
 	if len(out) == len(s.Accounts) {
-		fmt.Fprintf(os.Stderr, "error: no account named %q\n", args[0])
+		fmt.Fprintf(os.Stderr, "error: no account with email %q\n", args[0])
 		os.Exit(1)
 	}
 	s.Accounts = out
@@ -490,14 +525,140 @@ func cmdRm(args []string) {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("removed %q\n", args[0])
+	fmt.Printf("removed %s\n", args[0])
 }
 
 // result holds a rendered snapshot for one account.
 type result struct {
-	label string
-	usage usageResponse
-	err   error
+	email  string
+	usage  usageResponse
+	active bool // this account is the one currently logged into Claude Code
+	err    error
+}
+
+// activeUUID returns the account uuid currently logged into Claude Code, or ""
+// if it can't be determined (no keychain entry, offline, etc.). Best-effort.
+func activeUUID() string {
+	c, err := keychainCredential()
+	if err != nil {
+		return ""
+	}
+	uuid, _, err := fetchProfile(c.AccessToken)
+	if err != nil {
+		return ""
+	}
+	return uuid
+}
+
+func poll(s *store) []result {
+	active := activeUUID()
+	results := make([]result, len(s.Accounts))
+	changed := false
+	for i := range s.Accounts {
+		u, nc, err := fetchUsage(s.Accounts[i].Credential)
+		if nc.AccessToken != s.Accounts[i].Credential.AccessToken {
+			s.Accounts[i].Credential = nc
+			changed = true
+		}
+		results[i] = result{
+			email:  s.Accounts[i].Email,
+			usage:  u,
+			active: active != "" && s.Accounts[i].AccountUUID == active,
+			err:    err,
+		}
+	}
+	if changed {
+		_ = saveStore(s)
+	}
+	sort.SliceStable(results, func(i, j int) bool { return results[i].email < results[j].email })
+	return results
+}
+
+// --- Bubble Tea TUI ---
+
+type pollMsg []result
+
+type model struct {
+	store   *store
+	results []result
+	updated time.Time
+	loading bool
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(m.pollCmd(), tea.EnterAltScreen)
+}
+
+func (m model) pollCmd() tea.Cmd {
+	s := m.store
+	return func() tea.Msg { return pollMsg(poll(s)) }
+}
+
+func tick() tea.Cmd {
+	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+type tickMsg struct{}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c", "esc":
+			return m, tea.Quit
+		case "r":
+			if !m.loading {
+				m.loading = true
+				return m, m.pollCmd()
+			}
+		}
+	case pollMsg:
+		m.results = msg
+		m.updated = time.Now()
+		m.loading = false
+		return m, tick()
+	case tickMsg:
+		m.loading = true
+		return m, m.pollCmd()
+	}
+	return m, nil
+}
+
+var (
+	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	styleActive = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
+	styleEmail  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	styleDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	styleErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+)
+
+func (m model) View() string {
+	now := time.Now()
+	var b strings.Builder
+	status := ""
+	if m.loading {
+		status = "  ⟳ refreshing…"
+	}
+	b.WriteString(styleTitle.Render("Claude Max Usage") +
+		styleDim.Render("   "+m.updated.Format("15:04:05")+status) + "\n")
+	b.WriteString(styleDim.Render("r refresh · q quit · ● = active Claude Code session") + "\n\n")
+
+	for _, r := range m.results {
+		marker := "  "
+		name := styleEmail.Render(r.email)
+		if r.active {
+			marker = styleActive.Render("● ")
+			name = styleActive.Render(r.email + "  (active)")
+		}
+		b.WriteString(marker + name + "\n")
+		if r.err != nil {
+			b.WriteString("    " + styleErr.Render(r.err.Error()) + "\n\n")
+			continue
+		}
+		b.WriteString("    " + styleDim.Render("5-hour ") + bar(r.usage.FiveHour, now) + "\n")
+		b.WriteString("    " + styleDim.Render("7-day  ") + bar(r.usage.SevenDay, now) + "\n\n")
+	}
+	return b.String()
 }
 
 func cmdDashboard() {
@@ -507,87 +668,13 @@ func cmdDashboard() {
 		os.Exit(1)
 	}
 	if len(s.Accounts) == 0 {
-		fmt.Println("no accounts configured — run: claude-usage add <label>")
+		fmt.Println("no accounts configured — run: claude-usage login")
 		return
 	}
-
-	// Restore the cursor on Ctrl-C / SIGTERM, not just on 'q'.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Print("\033[?25h")
-		os.Exit(0)
-	}()
-
-	// 'q' + Enter to quit, 'r' + Enter to force refresh.
-	refreshCh := make(chan struct{}, 1)
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			switch strings.TrimSpace(sc.Text()) {
-			case "q":
-				fmt.Print("\033[?25h")
-				os.Exit(0)
-			case "r":
-				select {
-				case refreshCh <- struct{}{}:
-				default:
-				}
-			}
-		}
-		_ = sc.Err() // stdin closed; keyboard controls stop but the dashboard keeps polling
-	}()
-
-	fmt.Print("\033[?25l") // hide cursor
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-	for {
-		results := poll(s)
-		render(results)
-		select {
-		case <-ticker.C:
-		case <-refreshCh:
-		}
-	}
-}
-
-func poll(s *store) []result {
-	results := make([]result, len(s.Accounts))
-	changed := false
-	for i := range s.Accounts {
-		u, nc, err := fetchUsage(s.Accounts[i].Credential)
-		if nc.AccessToken != s.Accounts[i].Credential.AccessToken {
-			s.Accounts[i].Credential = nc
-			changed = true
-		}
-		results[i] = result{label: s.Accounts[i].Label, usage: u, err: err}
-	}
-	if changed {
-		_ = saveStore(s)
-	}
-	sort.SliceStable(results, func(i, j int) bool { return results[i].label < results[j].label })
-	return results
-}
-
-func render(results []result) {
-	fmt.Print("\033[H\033[2J") // home + clear
-	now := time.Now()
-	fmt.Printf("  Claude Max Usage — %s   (r+Enter refresh · q+Enter quit)\n\n", now.Format("15:04:05"))
-	labelW := 8
-	for _, r := range results {
-		if len(r.label) > labelW {
-			labelW = len(r.label)
-		}
-	}
-	for _, r := range results {
-		if r.err != nil {
-			fmt.Printf("  %-*s  \033[31m%s\033[0m\n\n", labelW, r.label, r.err)
-			continue
-		}
-		fmt.Printf("  %-*s\n", labelW, r.label)
-		fmt.Printf("    5-hour  %s\n", bar(r.usage.FiveHour, now))
-		fmt.Printf("    7-day   %s\n\n", bar(r.usage.SevenDay, now))
+	normalizeStore(s)
+	if _, err := tea.NewProgram(model{store: s, loading: true}).Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
 	}
 }
 
@@ -595,22 +682,22 @@ func render(results []result) {
 func bar(w window, now time.Time) string {
 	const width = 24
 	filled := min(max(int(w.Utilization/100*width+0.5), 0), width)
-	color := "\033[32m" // green
+	color := lipgloss.Color("10") // green
 	switch {
 	case w.Utilization >= 90:
-		color = "\033[31m" // red
+		color = lipgloss.Color("9") // red
 	case w.Utilization >= 70:
-		color = "\033[33m" // yellow
+		color = lipgloss.Color("11") // yellow
 	}
-	b := color + strings.Repeat("█", filled) + "\033[90m" + strings.Repeat("░", width-filled) + "\033[0m"
+	fill := lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("█", filled))
+	rest := styleDim.Render(strings.Repeat("░", width-filled))
 	reset := ""
 	if t, err := time.Parse(time.RFC3339, w.ResetsAt); err == nil {
-		d := t.Sub(now)
-		if d > 0 {
-			reset = fmt.Sprintf("  resets in %s", shortDur(d))
+		if d := t.Sub(now); d > 0 {
+			reset = styleDim.Render("  resets in " + shortDur(d))
 		}
 	}
-	return fmt.Sprintf("%s %5.1f%%%s", b, w.Utilization, reset)
+	return fmt.Sprintf("%s%s %5.1f%%%s", fill, rest, w.Utilization, reset)
 }
 
 func shortDur(d time.Duration) string {
