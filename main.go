@@ -64,10 +64,21 @@ type account struct {
 	Credential  credential `json:"credential"`
 }
 
-// store is the on-disk config: the set of monitored accounts.
+// store is the on-disk config: the set of monitored accounts plus settings.
 type store struct {
 	Accounts []account `json:"accounts"`
+	Settings settings  `json:"settings"`
 }
+
+// settings holds user-tunable menu bar behavior.
+type settings struct {
+	// NotifyThresholdPct is the utilization percent (0–100) at or above which
+	// the active account triggers a notification. Applies to both windows.
+	NotifyThresholdPct float64 `json:"notifyThresholdPct"`
+}
+
+// defaultThresholdPct is used when no threshold has been configured.
+const defaultThresholdPct = 90
 
 // usageResponse is the subset of the /usage payload we render.
 type usageResponse struct {
@@ -96,6 +107,9 @@ func loadStore() (*store, error) {
 	var s store
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if s.Settings.NotifyThresholdPct <= 0 {
+		s.Settings.NotifyThresholdPct = defaultThresholdPct
 	}
 	return &s, nil
 }
@@ -295,7 +309,22 @@ func callUsage(token string) (usageResponse, error) {
 	}
 }
 
+// runningInBundle reports whether this binary was launched from inside a macOS
+// .app bundle (double-clicked or opened via a LaunchAgent), in which case there
+// are no CLI args and we default to the menu bar app.
+func runningInBundle() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(exe, ".app/Contents/MacOS/")
+}
+
 func main() {
+	if len(os.Args) == 1 && runningInBundle() {
+		cmdMenubar()
+		return
+	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "login":
@@ -309,6 +338,9 @@ func main() {
 			return
 		case "rm":
 			cmdRm(os.Args[2:])
+			return
+		case "menubar":
+			cmdMenubar()
 			return
 		case "-h", "--help", "help":
 			usage()
@@ -329,6 +361,7 @@ func usage() {
   claude-usage add            capture the account currently logged into Claude Code
   claude-usage list           list configured accounts
   claude-usage rm <email>     remove an account
+  claude-usage menubar        run the macOS menu bar app (👾 NN%)
   claude-usage                live dashboard
 
 Accounts are identified by their email (read from the account profile) — no
