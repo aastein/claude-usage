@@ -76,10 +76,15 @@ blue `*` marks the account a swap would pick next.
 
 ### Auto-swap
 
-When the active account's **session (5h)** usage crosses the alert threshold,
-auto-swap rewrites the Claude Code keychain credential to a healthier account.
-A running Claude Code session picks up the new token on its next request — if a
-session stops on an API limit, typing `continue` resumes it on the new account.
+Auto-swap triggers when the active account crosses **either** limit:
+
+- **session (5h)** usage reaches the alert threshold, or
+- **weekly (7d)** usage reaches **99%**.
+
+On trigger it rewrites the Claude Code keychain credential to a healthier
+account. A running Claude Code session picks up the new token on its next
+request — if a session stops on an API limit, typing `continue` resumes it on
+the new account.
 
 Target selection:
 

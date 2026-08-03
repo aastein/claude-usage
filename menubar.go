@@ -247,11 +247,17 @@ func lowestWeekly(rs []result) *result {
 	return best
 }
 
-// maybeSwap performs an auto-swap when enabled and the active account's session
-// has crossed the alert threshold. It refreshes the target's credential, writes
-// it into the Claude Code keychain (in place, preserving the ACL), persists the
-// refreshed token, and notifies. The running Claude Code session adopts the new
-// token on its next request.
+// weeklySwapPct is the active account's WEEKLY (7d) utilization at or above
+// which a swap is triggered, independent of the session threshold — the weekly
+// limit is near exhaustion and only a restart would otherwise recover it.
+const weeklySwapPct = 99
+
+// maybeSwap performs an auto-swap when enabled and the active account has crossed
+// a trigger: SESSION (5h) usage >= the alert threshold, or WEEKLY (7d) usage >=
+// weeklySwapPct. It refreshes the target's credential, writes it into the Claude
+// Code keychain (in place, preserving the ACL), persists the refreshed token, and
+// notifies. The running Claude Code session adopts the new token on its next
+// request.
 func (st *menuState) maybeSwap(app *menuet.Application, results []result, threshold float64) {
 	st.mu.RLock()
 	enabled := st.store.Settings.AutoSwapOnAlert
@@ -272,7 +278,12 @@ func (st *menuState) maybeSwap(app *menuet.Application, results []result, thresh
 			others = append(others, results[i])
 		}
 	}
-	if active == nil || active.usage.FiveHour.Utilization < threshold {
+	if active == nil {
+		return
+	}
+	sessionTrig := active.usage.FiveHour.Utilization >= threshold
+	weeklyTrig := active.usage.SevenDay.Utilization >= weeklySwapPct
+	if !sessionTrig && !weeklyTrig {
 		return
 	}
 
@@ -280,13 +291,18 @@ func (st *menuState) maybeSwap(app *menuet.Application, results []result, thresh
 	if decision.target == nil {
 		return
 	}
-	st.performSwap(app, active, decision.target)
+
+	note := fmt.Sprintf("%s session hit %.0f%%.", active.email, active.usage.FiveHour.Utilization)
+	if weeklyTrig {
+		note = fmt.Sprintf("%s weekly hit %.0f%%.", active.email, active.usage.SevenDay.Utilization)
+	}
+	st.performSwap(app, decision.target, note)
 }
 
 // performSwap refreshes the target account's credential, installs it into the
 // keychain, and persists it. On failure it notifies and leaves state untouched
 // so the next poll retries.
-func (st *menuState) performSwap(app *menuet.Application, from, to *result) {
+func (st *menuState) performSwap(app *menuet.Application, to *result, note string) {
 	st.mu.Lock()
 	// Locate the target account in the store by its stable uuid.
 	idx := -1
@@ -333,8 +349,8 @@ func (st *menuState) performSwap(app *menuet.Application, from, to *result) {
 	st.signalWake()
 
 	msg := "Type \"continue\" in Claude Code to resume on the new account."
-	if from != nil {
-		msg = fmt.Sprintf("%s session hit %.0f%%. ", from.email, from.usage.FiveHour.Utilization) + msg
+	if note != "" {
+		msg = note + " " + msg
 	}
 	app.Notification(menuet.Notification{
 		Title:      "Claude account swapped",
@@ -463,24 +479,17 @@ func (st *menuState) swapTo(app *menuet.Application, uuid string) {
 	st.mu.RLock()
 	results := st.results
 	st.mu.RUnlock()
-	var to, from result
-	var haveTo, haveFrom bool
+	var to result
+	haveTo := false
 	for i := range results {
 		if results[i].uuid == uuid {
 			to, haveTo = results[i], true
-		}
-		if results[i].active {
-			from, haveFrom = results[i], true
 		}
 	}
 	if !haveTo {
 		return
 	}
-	var fromPtr *result
-	if haveFrom {
-		fromPtr = &from
-	}
-	st.performSwap(app, fromPtr, &to)
+	st.performSwap(app, &to, "") // manual swap: no trigger note
 }
 
 // toggleAutoSwap flips and persists the auto-swap setting.
