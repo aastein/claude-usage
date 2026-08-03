@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -40,6 +41,10 @@ const (
 	oauthBeta    = "oauth-2025-04-20"
 	keychainName = "Claude Code-credentials"
 	pollInterval = 5 * time.Minute
+	// menubarPollInterval is tighter than the TUI's so an active session near
+	// its limit is observed in the 98–100% band before it blocks, giving the
+	// auto-swap a chance to fire before the API limit is hit.
+	menubarPollInterval = 2 * time.Minute
 )
 
 // httpClient bounds every request so a stalled connection can't hang the poll loop.
@@ -75,6 +80,11 @@ type settings struct {
 	// NotifyThresholdPct is the utilization percent (0–100) at or above which
 	// the active account triggers a notification. Applies to both windows.
 	NotifyThresholdPct float64 `json:"notifyThresholdPct"`
+	// AutoSwapOnAlert, when true, rewrites the Claude Code keychain credential
+	// to a healthier account when the active account's SESSION (5h) usage
+	// crosses NotifyThresholdPct. Off by default: it silently changes which
+	// account subsequent Claude Code requests bill to.
+	AutoSwapOnAlert bool `json:"autoSwapOnAlert"`
 }
 
 // defaultThresholdPct is used when no threshold has been configured.
@@ -183,6 +193,47 @@ func keychainCredential() (credential, error) {
 		return credential{}, fmt.Errorf("parse keychain credential: %w", err)
 	}
 	return c, nil
+}
+
+// keychainAcctAttr returns the "account" attribute of the Claude Code keychain
+// item, needed to update it in place. The attribute is printed to the combined
+// output of `security ... -g` as: "acct"<blob>="<value>".
+func keychainAcctAttr() (string, error) {
+	out, err := exec.Command("security", "find-generic-password", "-s", keychainName, "-g").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("read keychain attrs %q: %w", keychainName, err)
+	}
+	m := acctAttrRe.FindSubmatch(out)
+	if m == nil {
+		return "", fmt.Errorf("keychain item %q has no acct attribute", keychainName)
+	}
+	return string(m[1]), nil
+}
+
+var acctAttrRe = regexp.MustCompile(`"acct"<blob>="([^"]*)"`)
+
+// writeKeychainCredential replaces the Claude Code keychain credential in place,
+// preserving the item's ACL so Claude Code keeps reading it without a re-auth
+// prompt. It writes Claude Code's native {"claudeAiOauth": {...}} shape. The
+// running Claude Code session picks this up on its next request.
+func writeKeychainCredential(c credential) error {
+	acct, err := keychainAcctAttr()
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(struct {
+		ClaudeAiOauth credential `json:"claudeAiOauth"`
+	}{c})
+	if err != nil {
+		return err
+	}
+	// -U updates the existing item (matched by acct+service), preserving its ACL.
+	out, err := exec.Command("security", "add-generic-password",
+		"-U", "-a", acct, "-s", keychainName, "-w", string(payload)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("write keychain %q: %w: %s", keychainName, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // refresh exchanges the refresh token for a fresh access token, returning the
@@ -564,6 +615,7 @@ func cmdRm(args []string) {
 // result holds a rendered snapshot for one account.
 type result struct {
 	email  string
+	uuid   string // stable account uuid, for mapping back to the stored credential
 	usage  usageResponse
 	active bool // this account is the one currently logged into Claude Code
 	err    error
@@ -595,6 +647,7 @@ func poll(s *store) []result {
 		}
 		results[i] = result{
 			email:  s.Accounts[i].Email,
+			uuid:   s.Accounts[i].AccountUUID,
 			usage:  u,
 			active: active != "" && s.Accounts[i].AccountUUID == active,
 			err:    err,

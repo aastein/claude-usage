@@ -19,6 +19,7 @@ type menuState struct {
 	updated  time.Time
 	polling  bool
 	notified map[string]string // window key -> ResetsAt that last fired a notification
+	wake     chan struct{}     // signals the poll loop to refresh immediately (e.g. after a swap)
 }
 
 // cmdMenubar runs the macOS menu bar app: a "👾 NN%" title showing the active
@@ -47,7 +48,7 @@ func cmdMenubar() {
 	}
 	normalizeStore(s)
 
-	st := &menuState{store: s, notified: map[string]string{}}
+	st := &menuState{store: s, notified: map[string]string{}, wake: make(chan struct{}, 1)}
 
 	app := menuet.App()
 	app.Name = "Claude Usage"
@@ -79,10 +80,23 @@ func (st *menuState) pollLoop(app *menuet.Application) {
 		st.mu.Unlock()
 
 		st.maybeNotify(app, results, threshold)
+		st.maybeSwap(app, results, threshold)
 		app.SetMenuState(&menuet.MenuState{Title: st.title()})
 		app.MenuChanged()
 
-		time.Sleep(pollInterval)
+		select {
+		case <-time.After(menubarPollInterval):
+		case <-st.wake: // an action (e.g. a swap) asked for an immediate refresh
+		}
+	}
+}
+
+// signalWake asks the poll loop to refresh now, without blocking if a wake is
+// already pending.
+func (st *menuState) signalWake() {
+	select {
+	case st.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -156,6 +170,180 @@ func (st *menuState) checkWindow(app *menuet.Application, label string, w window
 	})
 }
 
+// deferThresholdPct is the second-tier SESSION trigger: when no account is below
+// the alert level, the swap waits until the active session is this high (just
+// under the 100% API limit) before accepting a less-fresh target.
+const deferThresholdPct = 98
+
+// swapDecision is the outcome of evaluating an alert for an auto-swap.
+type swapDecision struct {
+	target *result // account to install into the keychain, or nil for no swap
+	reason string  // why (for logging / diagnostics)
+}
+
+// selectSwapTarget decides whether and where to swap when the active account's
+// SESSION (5h) usage has crossed the alert threshold. The threshold applies to
+// the session window only; weekly (7d) usage is used solely to rank candidates.
+func selectSwapTarget(active result, others []result, threshold float64) swapDecision {
+	if len(others) == 0 {
+		return swapDecision{nil, "no other accounts to swap to"}
+	}
+	// Tier 1: candidates whose session is below the alert level, lowest weekly.
+	if t1 := sessionBelow(others, threshold); len(t1) > 0 {
+		return swapDecision{lowestWeekly(t1), "tier1: session below threshold, lowest weekly"}
+	}
+	// Tier 2: only once the active session is critically high (near the limit).
+	if active.usage.FiveHour.Utilization < deferThresholdPct {
+		return swapDecision{nil, "no candidate below threshold; deferring until active session hits defer level"}
+	}
+	if t2 := sessionBelow(others, deferThresholdPct); len(t2) > 0 {
+		return swapDecision{lowestWeekly(t2), "tier2: session below defer level, lowest weekly"}
+	}
+	return swapDecision{nil, "no candidate with session below defer level; no swap"}
+}
+
+// previewTargetUUID returns the uuid of the account a swap would currently pick,
+// or "" if none qualifies. It mirrors selectSwapTarget's ranking (session below
+// the alert level, else below the defer level; lowest weekly) but ignores the
+// active account's utilization so the standby target shows before an alert fires.
+func previewTargetUUID(results []result, threshold float64) string {
+	var others []result
+	for i := range results {
+		if results[i].err == nil && !results[i].active {
+			others = append(others, results[i])
+		}
+	}
+	cands := sessionBelow(others, threshold)
+	if len(cands) == 0 {
+		cands = sessionBelow(others, deferThresholdPct)
+	}
+	if len(cands) == 0 {
+		return ""
+	}
+	return lowestWeekly(cands).uuid
+}
+
+// sessionBelow returns accounts whose 5h SESSION usage is strictly below cap.
+func sessionBelow(rs []result, cap float64) []result {
+	var out []result
+	for i := range rs {
+		if rs[i].usage.FiveHour.Utilization < cap {
+			out = append(out, rs[i])
+		}
+	}
+	return out
+}
+
+// lowestWeekly picks the account with the lowest 7d WEEKLY usage, ties broken by
+// email for determinism.
+func lowestWeekly(rs []result) *result {
+	best := &rs[0]
+	for i := 1; i < len(rs); i++ {
+		w, bw := rs[i].usage.SevenDay.Utilization, best.usage.SevenDay.Utilization
+		if w < bw || (w == bw && rs[i].email < best.email) {
+			best = &rs[i]
+		}
+	}
+	return best
+}
+
+// maybeSwap performs an auto-swap when enabled and the active account's session
+// has crossed the alert threshold. It refreshes the target's credential, writes
+// it into the Claude Code keychain (in place, preserving the ACL), persists the
+// refreshed token, and notifies. The running Claude Code session adopts the new
+// token on its next request.
+func (st *menuState) maybeSwap(app *menuet.Application, results []result, threshold float64) {
+	st.mu.RLock()
+	enabled := st.store.Settings.AutoSwapOnAlert
+	st.mu.RUnlock()
+	if !enabled {
+		return
+	}
+
+	var active *result
+	var others []result
+	for i := range results {
+		if results[i].err != nil {
+			continue // unknown usage — never a candidate, and can't trust "active" state
+		}
+		if results[i].active {
+			active = &results[i]
+		} else {
+			others = append(others, results[i])
+		}
+	}
+	if active == nil || active.usage.FiveHour.Utilization < threshold {
+		return
+	}
+
+	decision := selectSwapTarget(*active, others, threshold)
+	if decision.target == nil {
+		return
+	}
+	st.performSwap(app, active, decision.target)
+}
+
+// performSwap refreshes the target account's credential, installs it into the
+// keychain, and persists it. On failure it notifies and leaves state untouched
+// so the next poll retries.
+func (st *menuState) performSwap(app *menuet.Application, from, to *result) {
+	st.mu.Lock()
+	// Locate the target account in the store by its stable uuid.
+	idx := -1
+	for i := range st.store.Accounts {
+		if st.store.Accounts[i].AccountUUID == to.uuid {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		st.mu.Unlock()
+		return
+	}
+	cred := st.store.Accounts[idx].Credential
+	st.mu.Unlock()
+
+	// Ensure the token we hand off is fresh so the swapped session isn't blocked
+	// by an expired access token.
+	if nc, err := refresh(cred); err == nil {
+		cred = nc
+	}
+
+	if err := writeKeychainCredential(cred); err != nil {
+		app.Notification(menuet.Notification{
+			Title:      "Claude usage — swap failed",
+			Subtitle:   fmt.Sprintf("could not switch to %s", to.email),
+			Message:    err.Error(),
+			Identifier: "claude-usage-swap-error",
+		})
+		return
+	}
+
+	// Persist the refreshed credential.
+	st.mu.Lock()
+	st.store.Accounts[idx].Credential = cred
+	s := st.store
+	st.mu.Unlock()
+	if err := saveStore(s); err != nil {
+		fmt.Fprintln(os.Stderr, "persist after swap:", err)
+	}
+
+	// Refresh the display now so the active dot/target move immediately rather
+	// than on the next poll tick.
+	st.signalWake()
+
+	msg := "Type \"continue\" in Claude Code to resume on the new account."
+	if from != nil {
+		msg = fmt.Sprintf("%s session hit %.0f%%. ", from.email, from.usage.FiveHour.Utilization) + msg
+	}
+	app.Notification(menuet.Notification{
+		Title:      "Claude account swapped",
+		Subtitle:   fmt.Sprintf("→ %s", to.email),
+		Message:    msg,
+		Identifier: "claude-usage-swap",
+	})
+}
+
 // menuItems builds the dropdown: every account with both windows, then the
 // alert-threshold submenu. menuet auto-appends "Start at Login" and "Quit".
 func (st *menuState) menuItems() []menuet.MenuItem {
@@ -168,6 +356,12 @@ func (st *menuState) menuItems() []menuet.MenuItem {
 
 	now := time.Now()
 	items := []menuet.MenuItem{}
+
+	// When auto-swap is on, mark the account a swap would currently pick.
+	swapTarget := ""
+	if st.store.Settings.AutoSwapOnAlert {
+		swapTarget = previewTargetUUID(results, threshold)
+	}
 
 	head := "Updating…"
 	if !updated.IsZero() {
@@ -197,6 +391,9 @@ func (st *menuState) menuItems() []menuet.MenuItem {
 		if r.active {
 			title = append(title, menuet.TextRun{Text: "  active", FontSize: 11, Color: menuet.SystemGreen})
 		}
+		if swapTarget != "" && r.uuid == swapTarget {
+			title = append(title, menuet.TextRun{Text: "  *", FontWeight: menuet.WeightBold, Color: menuet.SystemBlue})
+		}
 		// A no-op Clicked marks the row clickable so AppKit renders it
 		// enabled (full contrast) instead of dimming it like a disabled item.
 		items = append(items, menuet.Regular{Runs: title, Clicked: noop})
@@ -204,35 +401,114 @@ func (st *menuState) menuItems() []menuet.MenuItem {
 			items = append(items, menuet.Regular{Runs: []menuet.TextRun{{Text: r.err.Error(), FontSize: 12, Color: menuet.SystemRed}}, Clicked: noop})
 			continue
 		}
-		items = append(items, menuet.Regular{Runs: usageRuns(r.usage, now), Clicked: noop})
+		items = append(items, menuet.Regular{Runs: windowRuns("Session", "5h", r.usage.FiveHour, now), Clicked: noop})
+		items = append(items, menuet.Regular{Runs: windowRuns("Weekly", "7d", r.usage.SevenDay, now), Clicked: noop})
 	}
+
+	st.mu.RLock()
+	autoSwap := st.store.Settings.AutoSwapOnAlert
+	st.mu.RUnlock()
 
 	items = append(items, menuet.Separator{})
 	items = append(items, menuet.Regular{
 		Text:     fmt.Sprintf("Alert threshold: %.0f%%", threshold),
 		Children: func() []menuet.MenuItem { return st.thresholdItems() },
 	})
+	items = append(items, menuet.Regular{
+		Text:    "Enable Auto-swap on alert",
+		State:   autoSwap,
+		Clicked: st.toggleAutoSwap,
+	})
+	items = append(items, menuet.Regular{
+		Text:     "Swap to",
+		Children: func() []menuet.MenuItem { return st.swapMenuItems() },
+	})
 	return items
+}
+
+// swapMenuItems lists every account as a manual swap target. The active account
+// is checked and non-clickable; selecting another swaps to it immediately.
+func (st *menuState) swapMenuItems() []menuet.MenuItem {
+	st.mu.RLock()
+	results := st.results
+	st.mu.RUnlock()
+
+	sorted := make([]result, len(results))
+	copy(sorted, results)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].email < sorted[j].email })
+
+	var items []menuet.MenuItem
+	for _, r := range sorted {
+		r := r
+		if r.active {
+			items = append(items, menuet.Regular{Text: r.email, State: true, Clicked: noop})
+			continue
+		}
+		if r.err != nil {
+			// Unknown usage/identity — can't safely swap to it.
+			items = append(items, menuet.Regular{Text: r.email + " (unavailable)", Clicked: noop})
+			continue
+		}
+		uuid := r.uuid
+		items = append(items, menuet.Regular{
+			Text:    r.email,
+			Clicked: func() { st.swapTo(menuet.App(), uuid) },
+		})
+	}
+	return items
+}
+
+// swapTo swaps to the account with the given uuid, regardless of threshold.
+func (st *menuState) swapTo(app *menuet.Application, uuid string) {
+	st.mu.RLock()
+	results := st.results
+	st.mu.RUnlock()
+	var to, from result
+	var haveTo, haveFrom bool
+	for i := range results {
+		if results[i].uuid == uuid {
+			to, haveTo = results[i], true
+		}
+		if results[i].active {
+			from, haveFrom = results[i], true
+		}
+	}
+	if !haveTo {
+		return
+	}
+	var fromPtr *result
+	if haveFrom {
+		fromPtr = &from
+	}
+	st.performSwap(app, fromPtr, &to)
+}
+
+// toggleAutoSwap flips and persists the auto-swap setting.
+func (st *menuState) toggleAutoSwap() {
+	st.mu.Lock()
+	st.store.Settings.AutoSwapOnAlert = !st.store.Settings.AutoSwapOnAlert
+	s := st.store
+	st.mu.Unlock()
+	if err := saveStore(s); err != nil {
+		fmt.Fprintln(os.Stderr, "save settings:", err)
+	}
+	menuet.App().MenuChanged()
 }
 
 // noop is attached to informational rows so AppKit treats them as enabled and
 // renders them at full contrast rather than dimming disabled items.
 func noop() {}
 
-// usageRuns renders both windows on one compact, color-coded line:
-// "5h 54% · resets 3h52m    7d 11% · resets 6d16h".
-func usageRuns(u usageResponse, now time.Time) []menuet.TextRun {
-	runs := windowRuns("5h", u.FiveHour, now)
-	runs = append(runs, menuet.TextRun{Text: "      "})
-	runs = append(runs, windowRuns("7d", u.SevenDay, now)...)
-	return runs
-}
-
-// windowRuns renders one window as "<label> <pct%> · resets <dur>" with the
-// percentage colored by severity.
-func windowRuns(label string, w window, now time.Time) []menuet.TextRun {
+// windowRuns renders one window on its own line as
+// "<Name> (5h)  <pct%> · resets <dur>", with the name spelled out (Session /
+// Weekly) so the two windows are unmistakable and the percentage colored by
+// severity.
+func windowRuns(name, short string, w window, now time.Time) []menuet.TextRun {
+	// Pad the name column so the two rows' percentages line up ("Session" is
+	// longer than "Weekly").
+	label := fmt.Sprintf("%-7s (%s)  ", name, short)
 	runs := []menuet.TextRun{
-		{Text: label + " ", Color: menuet.LabelSecondary},
+		{Text: label, Color: menuet.LabelSecondary},
 		{Text: fmt.Sprintf("%.0f%%", w.Utilization), FontWeight: menuet.WeightBold, Color: severityColor(w.Utilization)},
 	}
 	if t, err := time.Parse(time.RFC3339, w.ResetsAt); err == nil {
@@ -262,7 +538,7 @@ func (st *menuState) thresholdItems() []menuet.MenuItem {
 	current := st.store.Settings.NotifyThresholdPct
 	st.mu.RUnlock()
 	var items []menuet.MenuItem
-	for _, pct := range []float64{75, 80, 85, 90, 95} {
+	for _, pct := range []float64{70, 75, 80, 85, 90, 95, 98} {
 		pct := pct
 		items = append(items, menuet.Regular{
 			Text:    fmt.Sprintf("%.0f%%", pct),
@@ -280,9 +556,13 @@ func (st *menuState) setThreshold(pct float64) {
 	// A changed threshold re-arms all windows.
 	st.notified = map[string]string{}
 	s := st.store
+	results := st.results
 	st.mu.Unlock()
 	if err := saveStore(s); err != nil {
 		fmt.Fprintln(os.Stderr, "save settings:", err)
 	}
+	// Evaluate a swap immediately rather than waiting for the next poll tick,
+	// so lowering the threshold below the active session acts at once.
+	st.maybeSwap(menuet.App(), results, pct)
 	menuet.App().MenuChanged()
 }
