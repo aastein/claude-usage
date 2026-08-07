@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/caseymrm/menuet/v2"
@@ -37,6 +40,13 @@ func cmdMenubar() {
 		os.Exit(1)
 	}
 
+	// Refuse to start a second menu bar instance — multiple pollers multiply the
+	// request rate and get the account rate-limited (429).
+	if !acquireSingleInstance() {
+		fmt.Fprintln(os.Stderr, "another claude-usage menu bar instance is already running")
+		os.Exit(0)
+	}
+
 	s, err := loadStore()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -60,9 +70,34 @@ func cmdMenubar() {
 	app.RunApplication()
 }
 
+// instanceLock keeps the single-instance lock file open for the process
+// lifetime; closing it (or the process exiting) releases the flock.
+var instanceLock *os.File
+
+// acquireSingleInstance takes an exclusive, non-blocking flock on a lock file.
+// It returns false if another instance already holds it. Lock-file errors are
+// treated as "acquired" so a filesystem quirk never blocks startup.
+func acquireSingleInstance() bool {
+	p := filepath.Join(os.Getenv("HOME"), ".config", "claude-usage", "menubar.lock")
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return true
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return true
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return false
+	}
+	instanceLock = f // hold for the process lifetime
+	return true
+}
+
 // pollLoop refreshes usage immediately and then every pollInterval, updating the
 // title, redrawing the menu, and firing notifications.
 func (st *menuState) pollLoop(app *menuet.Application) {
+	backoff := 0 // consecutive rate-limited polls
 	for {
 		st.mu.Lock()
 		st.polling = true
@@ -84,11 +119,33 @@ func (st *menuState) pollLoop(app *menuet.Application) {
 		app.SetMenuState(&menuet.MenuState{Title: st.title()})
 		app.MenuChanged()
 
+		// Back off exponentially while rate-limited so we stop adding load,
+		// then return to the normal cadence once a poll succeeds.
+		interval := menubarPollInterval
+		if rateLimited(results) {
+			if backoff < 4 {
+				backoff++
+			}
+			interval = menubarPollInterval << backoff // up to 16× (~32 min)
+		} else {
+			backoff = 0
+		}
+
 		select {
-		case <-time.After(menubarPollInterval):
+		case <-time.After(interval):
 		case <-st.wake: // an action (e.g. a swap) asked for an immediate refresh
 		}
 	}
+}
+
+// rateLimited reports whether any account came back 429 this poll.
+func rateLimited(results []result) bool {
+	for i := range results {
+		if errors.Is(results[i].err, errRateLimited) {
+			return true
+		}
+	}
+	return false
 }
 
 // signalWake asks the poll loop to refresh now, without blocking if a wake is

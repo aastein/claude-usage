@@ -298,6 +298,10 @@ func fetchUsage(c credential) (usageResponse, credential, error) {
 
 var errUnauthorized = fmt.Errorf("unauthorized")
 
+// errRateLimited is returned when the usage endpoint responds 429, so the poll
+// loop can back off instead of hammering it.
+var errRateLimited = fmt.Errorf("rate limited (429) — polling too often")
+
 // fetchProfile returns the stable account uuid and email for a token.
 func fetchProfile(token string) (uuid, email string, err error) {
 	req, err := http.NewRequest(http.MethodGet, profileURL, nil)
@@ -354,7 +358,7 @@ func callUsage(token string) (usageResponse, error) {
 	case http.StatusUnauthorized:
 		return usageResponse{}, errUnauthorized
 	case http.StatusTooManyRequests:
-		return usageResponse{}, fmt.Errorf("rate limited (429) — polling too often")
+		return usageResponse{}, errRateLimited
 	default:
 		return usageResponse{}, fmt.Errorf("usage error (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
@@ -636,11 +640,26 @@ func activeUUID() string {
 }
 
 func poll(s *store) []result {
-	active := activeUUID()
 	// The active account's token is rotated by Claude Code out-of-band. Treat
 	// the keychain as the source of truth for it so we never refresh with a
 	// stale (rotated-away) refresh token, which fails with invalid_grant.
 	kc, kcErr := keychainCredential()
+
+	// Identify the active account by matching the keychain's access token to a
+	// stored account — free, and avoids a per-poll profile request (which counts
+	// against the rate limit). Fall back to the network lookup only if no match.
+	active := ""
+	if kcErr == nil {
+		for i := range s.Accounts {
+			if s.Accounts[i].Credential.AccessToken == kc.AccessToken {
+				active = s.Accounts[i].AccountUUID
+				break
+			}
+		}
+	}
+	if active == "" {
+		active = activeUUID()
+	}
 
 	results := make([]result, len(s.Accounts))
 	changed := false
